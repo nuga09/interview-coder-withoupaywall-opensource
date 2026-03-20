@@ -2,7 +2,7 @@
 import fs from "node:fs"
 import path from "node:path"
 import { ScreenshotHelper } from "./ScreenshotHelper"
-import { IProcessingHelperDeps } from "./main"
+import { IProcessingHelperDeps } from "./main_mkswindowTransparent"
 import * as axios from "axios"
 import { app, BrowserWindow, dialog } from "electron"
 import { OpenAI } from "openai"
@@ -49,6 +49,7 @@ export class ProcessingHelper {
   private openaiClient: OpenAI | null = null
   private geminiApiKey: string | null = null
   private anthropicClient: Anthropic | null = null
+  private groqClient: OpenAI | null = null
 
   // AbortControllers for API requests
   private currentProcessingAbortController: AbortController | null = null
@@ -104,9 +105,9 @@ export class ProcessingHelper {
           console.warn("No API key available, Gemini client not initialized");
         }
       } else if (config.apiProvider === "anthropic") {
-        // Reset other clients
         this.openaiClient = null;
         this.geminiApiKey = null;
+        this.groqClient = null;
         if (config.apiKey) {
           this.anthropicClient = new Anthropic({
             apiKey: config.apiKey,
@@ -115,10 +116,25 @@ export class ProcessingHelper {
           });
           console.log("Anthropic client initialized successfully");
         } else {
-          this.openaiClient = null;
-          this.geminiApiKey = null;
           this.anthropicClient = null;
           console.warn("No API key available, Anthropic client not initialized");
+        }
+      } else if (config.apiProvider === "groq") {
+        this.openaiClient = null;
+        this.geminiApiKey = null;
+        this.anthropicClient = null;
+        const groqKey = config.apiKey || process.env.GROQ_API_KEY;
+        if (groqKey) {
+          this.groqClient = new OpenAI({
+            apiKey: groqKey,
+            baseURL: "https://api.groq.com/openai/v1",
+            timeout: 60000,
+            maxRetries: 2
+          });
+          console.log("Groq client initialized successfully");
+        } else {
+          this.groqClient = null;
+          console.warn("No API key available, Groq client not initialized");
         }
       }
     } catch (error) {
@@ -126,6 +142,7 @@ export class ProcessingHelper {
       this.openaiClient = null;
       this.geminiApiKey = null;
       this.anthropicClient = null;
+      this.groqClient = null;
     }
   }
 
@@ -224,14 +241,17 @@ export class ProcessingHelper {
         return;
       }
     } else if (config.apiProvider === "anthropic" && !this.anthropicClient) {
-      // Add check for Anthropic client
       this.initializeAIClient();
-      
       if (!this.anthropicClient) {
         console.error("Anthropic client not initialized");
-        mainWindow.webContents.send(
-          this.deps.PROCESSING_EVENTS.API_KEY_INVALID
-        );
+        mainWindow.webContents.send(this.deps.PROCESSING_EVENTS.API_KEY_INVALID);
+        return;
+      }
+    } else if (config.apiProvider === "groq" && !this.groqClient) {
+      this.initializeAIClient();
+      if (!this.groqClient) {
+        console.error("Groq client not initialized");
+        mainWindow.webContents.send(this.deps.PROCESSING_EVENTS.API_KEY_INVALID);
         return;
       }
     }
@@ -615,27 +635,59 @@ export class ProcessingHelper {
           problemInfo = JSON.parse(jsonText);
         } catch (error: any) {
           console.error("Error using Anthropic API:", error);
-
-          // Add specific handling for Claude's limitations
           if (error.status === 429) {
-            return {
-              success: false,
-              error: "Claude API rate limit exceeded. Please wait a few minutes before trying again."
-            };
+            return { success: false, error: "Claude API rate limit exceeded. Please wait a few minutes before trying again." };
           } else if (error.status === 413 || (error.message && error.message.includes("token"))) {
-            return {
-              success: false,
-              error: "Your screenshots contain too much information for Claude to process. Switch to OpenAI or Gemini in settings which can handle larger inputs."
-            };
+            return { success: false, error: "Your screenshots contain too much information for Claude to process." };
           }
+          return { success: false, error: "Failed to process with Anthropic API. Please check your API key or try again later." };
+        }
+      } else if (config.apiProvider === "groq") {
+        if (!this.groqClient) {
+          return { success: false, error: "Groq API key not configured. Please check your settings." };
+        }
 
-          return {
-            success: false,
-            error: "Failed to process with Anthropic API. Please check your API key or try again later."
-          };
+        try {
+          const extractionModel = config.extractionModel || "llama-3.2-11b-vision-preview";
+          const messages = [
+            {
+              role: "system" as const,
+              content: "You are a coding challenge interpreter. Analyze the screenshot of the coding problem and extract all relevant information. Return the information in JSON format with these fields: problem_statement, constraints, example_input, example_output. Just return the structured JSON without any other text."
+            },
+            {
+              role: "user" as const,
+              content: [
+                {
+                  type: "text" as const,
+                  text: `Extract the coding problem details from these screenshots. Return in JSON format. Preferred coding language is ${language}.`
+                },
+                ...imageDataList.map(data => ({
+                  type: "image_url" as const,
+                  image_url: { url: `data:image/png;base64,${data}` }
+                }))
+              ]
+            }
+          ];
+
+          const extractionResponse = await this.groqClient.chat.completions.create({
+            model: extractionModel,
+            messages: messages,
+            max_tokens: 4000,
+            temperature: 0.2
+          });
+
+          const responseText = extractionResponse.choices[0].message.content;
+          const jsonText = responseText.replace(/```json|```/g, '').trim();
+          problemInfo = JSON.parse(jsonText);
+        } catch (error: any) {
+          console.error("Error using Groq API for extraction:", error);
+          if (error.status === 429) {
+            return { success: false, error: "Groq API rate limit exceeded. Please wait a moment and try again." };
+          }
+          return { success: false, error: "Failed to process with Groq API. Please check your API key or try again later." };
         }
       }
-      
+
       // Update the user on progress
       if (mainWindow) {
         mainWindow.webContents.send("processing-status", {
@@ -867,27 +919,39 @@ Your solution should be efficient, well-commented, and handle edge cases.
           responseContent = (response.content[0] as { type: 'text', text: string }).text;
         } catch (error: any) {
           console.error("Error using Anthropic API for solution:", error);
-
-          // Add specific handling for Claude's limitations
           if (error.status === 429) {
-            return {
-              success: false,
-              error: "Claude API rate limit exceeded. Please wait a few minutes before trying again."
-            };
+            return { success: false, error: "Claude API rate limit exceeded. Please wait a few minutes before trying again." };
           } else if (error.status === 413 || (error.message && error.message.includes("token"))) {
-            return {
-              success: false,
-              error: "Your screenshots contain too much information for Claude to process. Switch to OpenAI or Gemini in settings which can handle larger inputs."
-            };
+            return { success: false, error: "Your screenshots contain too much information for Claude to process." };
           }
+          return { success: false, error: "Failed to generate solution with Anthropic API. Please check your API key or try again later." };
+        }
+      } else if (config.apiProvider === "groq") {
+        if (!this.groqClient) {
+          return { success: false, error: "Groq API key not configured. Please check your settings." };
+        }
 
-          return {
-            success: false,
-            error: "Failed to generate solution with Anthropic API. Please check your API key or try again later."
-          };
+        try {
+          const solutionModel = config.solutionModel || "llama-3.3-70b-versatile";
+          const solutionResponse = await this.groqClient.chat.completions.create({
+            model: solutionModel,
+            messages: [
+              { role: "system", content: "You are an expert coding interview assistant. Provide clear, optimal solutions with detailed explanations." },
+              { role: "user", content: promptText }
+            ],
+            max_tokens: 4000,
+            temperature: 0.2
+          });
+          responseContent = solutionResponse.choices[0].message.content;
+        } catch (error: any) {
+          console.error("Error using Groq API for solution:", error);
+          if (error.status === 429) {
+            return { success: false, error: "Groq API rate limit exceeded. Please wait a moment and try again." };
+          }
+          return { success: false, error: "Failed to generate solution with Groq API. Please check your API key or try again later." };
         }
       }
-      
+
       // Extract parts from the response
       const codeMatch = responseContent.match(/```(?:\w+)?\s*([\s\S]*?)```/);
       const code = codeMatch ? codeMatch[1].trim() : responseContent;
@@ -1225,28 +1289,77 @@ If you include code examples, use proper markdown code blocks with language spec
           debugContent = (response.content[0] as { type: 'text', text: string }).text;
         } catch (error: any) {
           console.error("Error using Anthropic API for debugging:", error);
-          
-          // Add specific handling for Claude's limitations
           if (error.status === 429) {
-            return {
-              success: false,
-              error: "Claude API rate limit exceeded. Please wait a few minutes before trying again."
-            };
+            return { success: false, error: "Claude API rate limit exceeded. Please wait a few minutes before trying again." };
           } else if (error.status === 413 || (error.message && error.message.includes("token"))) {
-            return {
-              success: false,
-              error: "Your screenshots contain too much information for Claude to process. Switch to OpenAI or Gemini in settings which can handle larger inputs."
-            };
+            return { success: false, error: "Your screenshots contain too much information for Claude to process." };
           }
-          
-          return {
-            success: false,
-            error: "Failed to process debug request with Anthropic API. Please check your API key or try again later."
-          };
+          return { success: false, error: "Failed to process debug request with Anthropic API. Please check your API key or try again later." };
+        }
+      } else if (config.apiProvider === "groq") {
+        if (!this.groqClient) {
+          return { success: false, error: "Groq API key not configured. Please check your settings." };
+        }
+
+        try {
+          const debugModel = config.debuggingModel || "llama-3.2-11b-vision-preview";
+          const debugPrompt = `You are a coding interview assistant helping debug and improve solutions. Analyze these screenshots which include either error messages, incorrect outputs, or test cases, and provide detailed debugging help.
+
+I'm solving this coding problem: "${problemInfo.problem_statement}" in ${language}. I need help with debugging or improving my solution.
+
+YOUR RESPONSE MUST FOLLOW THIS EXACT STRUCTURE WITH THESE SECTION HEADERS:
+### Issues Identified
+- List each issue as a bullet point with clear explanation
+
+### Specific Improvements and Corrections
+- List specific code changes needed as bullet points
+
+### Optimizations
+- List any performance optimizations if applicable
+
+### Explanation of Changes Needed
+Here provide a clear explanation of why the changes are needed
+
+### Key Points
+- Summary bullet points of the most important takeaways
+
+If you include code examples, use proper markdown code blocks with language specification.`;
+
+          if (mainWindow) {
+            mainWindow.webContents.send("processing-status", {
+              message: "Analyzing code and generating debug feedback with Groq...",
+              progress: 60
+            });
+          }
+
+          const debugResponse = await this.groqClient.chat.completions.create({
+            model: debugModel,
+            messages: [
+              {
+                role: "user" as const,
+                content: [
+                  { type: "text" as const, text: debugPrompt },
+                  ...imageDataList.map(data => ({
+                    type: "image_url" as const,
+                    image_url: { url: `data:image/png;base64,${data}` }
+                  }))
+                ]
+              }
+            ],
+            max_tokens: 4000,
+            temperature: 0.2
+          });
+
+          debugContent = debugResponse.choices[0].message.content;
+        } catch (error: any) {
+          console.error("Error using Groq API for debugging:", error);
+          if (error.status === 429) {
+            return { success: false, error: "Groq API rate limit exceeded. Please wait a moment and try again." };
+          }
+          return { success: false, error: "Failed to process debug request with Groq API. Please check your API key or try again later." };
         }
       }
-      
-      
+
       if (mainWindow) {
         mainWindow.webContents.send("processing-status", {
           message: "Debug analysis complete",

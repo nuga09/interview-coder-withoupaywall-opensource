@@ -9,8 +9,8 @@ export default defineConfig({
     react(),
     electron([
       {
-        // main.ts
-        entry: "electron/main.ts",
+        // main entry
+        entry: "electron/main_mkswindowTransparent.ts",
         vite: {
           build: {
             outDir: "dist-electron",

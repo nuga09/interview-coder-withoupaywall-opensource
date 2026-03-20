@@ -4,7 +4,7 @@ const { shell } = require("electron")
 
 export const PROCESSING_EVENTS = {
   //global states
-  UNAUTHORIZED: "procesing-unauthorized",
+  UNAUTHORIZED: "processing-unauthorized",
   NO_SCREENSHOTS: "processing-no-screenshots",
   OUT_OF_CREDITS: "out-of-credits",
   API_KEY_INVALID: "api-key-invalid",
@@ -81,11 +81,10 @@ const electronAPI = {
     }
   },
   onDebugSuccess: (callback: (data: any) => void) => {
-    ipcRenderer.on("debug-success", (_event, data) => callback(data))
+    const subscription = (_event: any, data: any) => callback(data)
+    ipcRenderer.on("debug-success", subscription)
     return () => {
-      ipcRenderer.removeListener("debug-success", (_event, data) =>
-        callback(data)
-      )
+      ipcRenderer.removeListener("debug-success", subscription)
     }
   },
   onDebugError: (callback: (error: string) => void) => {
@@ -217,8 +216,8 @@ const electronAPI = {
   checkApiKey: () => ipcRenderer.invoke("check-api-key"),
   validateApiKey: (apiKey: string) => 
     ipcRenderer.invoke("validate-api-key", apiKey),
-  openExternal: (url: string) => 
-    ipcRenderer.invoke("openExternal", url),
+  openExternal: (url: string) =>
+    ipcRenderer.invoke("open-external-url", url),
   onApiKeyInvalid: (callback: () => void) => {
     const subscription = () => callback()
     ipcRenderer.on(PROCESSING_EVENTS.API_KEY_INVALID, subscription)
